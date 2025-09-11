@@ -223,3 +223,208 @@ All flow back into the scheduler.
 * **Overhead**: % compute vs baseline.
 
 
+### TEST1 PSEUDOCODES
+
+
+# 🧪 Demo: AEON (Delayed + Reversible Lock) vs Fixed LR vs Scheduler
+
+```python
+import torch
+from torch.optim import AdamW
+from transformers import AutoTokenizer, AutoModelForCausalLM, get_scheduler
+from datasets import load_dataset
+import random
+import matplotlib.pyplot as plt
+
+# ---------------------------
+# 1. Setup
+# ---------------------------
+model_name = "gpt2"
+tokenizer = AutoTokenizer.from_pretrained(model_name)
+if tokenizer.pad_token is None:
+    tokenizer.pad_token = tokenizer.eos_token
+
+def make_model():
+    model = AutoModelForCausalLM.from_pretrained(model_name)
+    return model.to(device)
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# ---------------------------
+# 2. Dataset
+# ---------------------------
+dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split="train[:1%]")
+examples = [ex["text"] for ex in dataset if len(ex["text"].strip()) > 20]
+
+def get_batch():
+    text = random.choice(examples)
+    enc = tokenizer(text, return_tensors="pt", truncation=True, max_length=64).to(device)
+    labels = enc["input_ids"].clone()
+    enc["labels"] = labels
+    return enc
+
+# ---------------------------
+# 3. Resonance gate
+# ---------------------------
+def resonance_gate(loss, prev_loss, step, max_steps, base_tol=0.3, min_tol=0.05):
+    if step < max_steps // 2:
+        tol = base_tol - (base_tol - min_tol) * (step / (max_steps // 2))
+    else:
+        tol = min_tol
+    if prev_loss is None:
+        return True
+    return abs(prev_loss - loss) > tol
+
+# ---------------------------
+# 4. AEON scheduler (delayed + reversible lock)
+# ---------------------------
+def update_hyperparams(loss, prev_loss, var_window, alpha, sigma, step, max_steps,
+                       best_loss, lock_mode, unlock_tolerance=1.0, lock_tolerance=0.5):
+    delta = prev_loss - loss if prev_loss is not None else 0.0
+
+    # --- Lock mode ---
+    if lock_mode:
+        alpha = max(alpha * 0.95, 8e-6)   # slow LR decay
+        sigma = max(sigma * 0.7, 1e-7)    # shrink exploration
+        # unlock if loss drifts up too far from best
+        if loss > best_loss + unlock_tolerance:
+            lock_mode = False
+        return alpha, sigma, lock_mode, best_loss
+
+    # --- Normal adaptive mode ---
+    if delta > 0:
+        alpha *= 1.05
+    else:
+        alpha *= 0.7
+
+    lr_floor = 1e-5 if step < max_steps // 2 else 2e-5
+    alpha = max(lr_floor, min(alpha, 5e-5))
+
+    if len(var_window) > 5 and torch.var(torch.tensor(var_window[-5:])) < 1e-2:
+        sigma *= 1.1
+    else:
+        sigma *= 0.9
+    sigma = max(1e-6, min(sigma, 1e-5))
+
+    if loss - prev_loss > 2.0:
+        alpha = lr_floor
+
+    if step % 50 == 0:
+        if loss > prev_loss:
+            alpha = min(alpha * 1.2, 5e-5)
+        elif loss < prev_loss:
+            alpha = min(alpha * 1.3, 5e-5)
+
+    # --- Trigger delayed lock ---
+    if step > max_steps // 3 and loss < best_loss - lock_tolerance:
+        best_loss = loss
+        lock_mode = True
+
+    return alpha, sigma, lock_mode, best_loss
+
+# ---------------------------
+# 5. Training loop
+# ---------------------------
+def run_experiment(mode="aeon", steps=200):
+    model = make_model()
+    optimizer = AdamW(model.parameters(), lr=3e-5)
+
+    if mode == "sched":
+        scheduler = get_scheduler(
+            "cosine",
+            optimizer=optimizer,
+            num_warmup_steps=50,
+            num_training_steps=steps
+        )
+    else:
+        scheduler = None
+
+    alpha, sigma = 3e-5, 1e-6
+    loss_ema, var_window = None, []
+    losses = []
+
+    best_loss = float("inf")
+    lock_mode = False
+
+    for step in range(1, steps+1):
+        enc = get_batch()
+        outputs = model(**enc)
+        loss = outputs.loss
+
+        prev_loss = loss_ema if loss_ema is not None else loss.item()
+        loss_ema = 0.9 * prev_loss + 0.1 * loss.item()
+        var_window.append(loss.item())
+
+        learn_flag = True
+        if mode == "aeon" and not lock_mode:
+            learn_flag = resonance_gate(loss.item(), prev_loss, step, steps)
+
+        if learn_flag:
+            optimizer.zero_grad()
+            loss.backward()
+
+            if mode == "aeon":
+                if not lock_mode and len(var_window) > 5 and torch.var(torch.tensor(var_window[-5:])) < 1.0:
+                    with torch.no_grad():
+                        for p in model.parameters():
+                            if p.grad is not None:
+                                p.grad += sigma * torch.randn_like(p.grad)
+                for g in optimizer.param_groups:
+                    g["lr"] = alpha
+
+            optimizer.step()
+
+        if mode == "aeon":
+            alpha, sigma, lock_mode, best_loss = update_hyperparams(
+                loss.item(), prev_loss, var_window, alpha, sigma, step, steps,
+                best_loss, lock_mode
+            )
+
+        if scheduler is not None:
+            scheduler.step()
+
+        losses.append(loss.item())
+
+        if step % 50 == 0:
+            lr_val = optimizer.param_groups[0]["lr"]
+            print(f"{mode.upper()} Step {step} | Loss {loss.item():.4f} | LR={lr_val:.2e} | σ={sigma:.1e} | Learn={learn_flag} | Lock={lock_mode}")
+
+    return losses
+
+# ---------------------------
+# 6. Run experiments
+# ---------------------------
+steps = 300
+print("Running AEON (delayed + reversible lock)...")
+aeon_losses = run_experiment("aeon", steps)
+
+print("Running Fixed LR...")
+fixed_losses = run_experiment("fixed", steps)
+
+print("Running Standard Scheduler...")
+sched_losses = run_experiment("sched", steps)
+
+# ---------------------------
+# 7. Plot
+# ---------------------------
+plt.figure(figsize=(8,4))
+plt.plot(aeon_losses, label="AEON Adaptive (Delayed + Reversible Lock)")
+plt.plot(fixed_losses, label="Fixed LR (3e-5)")
+plt.plot(sched_losses, label="Cosine Scheduler")
+plt.xlabel("Step")
+plt.ylabel("Loss")
+plt.title("Online LM on WikiText: AEON vs Fixed LR vs Scheduler")
+plt.legend()
+plt.show()
+```
+
+---
+
+## 🔍 What’s New
+
+* **Delayed lock:** AEON only locks after 1/3 of training (after \~100 steps).
+* **Soft lock:** LR/σ decay gradually, not instant freeze.
+* **Reversible lock:** if loss worsens +1.0 above best, AEON unlocks and resumes exploration.
+
+This should give you the “explore → consolidate → re-explore” behavior.
+
